@@ -422,6 +422,15 @@ async fn inspect_host(
     let items = client.get_items(&host.hostid).await?;
     // 停用监控项不参与指标采集与评分（全量明细 sheet 仍保留展示）
     let enabled_items: Vec<_> = items.iter().filter(|i| i.status != "1").cloned().collect();
+
+    // 👈 新增：按监控项类型判断主机是 Agent / SNMP / Mixed / Unknown
+    let device_kind: DeviceKind = crate::device_kind::classify_host(&enabled_items);
+    tracing::debug!(
+        "主机 {} 设备类型：{:?}",
+        host.host,
+        device_kind
+    );
+
     let c = classify_host(&enabled_items, rules);
 
     // ---- 主指标（preferred 来源聚合）----
@@ -652,13 +661,32 @@ async fn inspect_host(
     let uptime_days = c.uptime.as_ref().and_then(|i| i.last_f64()).map(|v| v / 86400.0);
     let cpu_num = c.cpu_num.as_ref().and_then(|i| i.last_f64()).map(|v| v as i64);
 
-    // ---- 可用性 ----
-    let available = c
+    // 👈 修改：可用性判断按设备类型分叉
+    // - Agent / Unknown：沿用原逻辑（agent_avail）
+    // - SNMP：snmp_avail + ICMP 可达
+    // - Mixed：两者都可用才算可用
+    let agent_ok = c
         .agent_avail
         .as_ref()
         .and_then(|i| i.last_f64())
         .map(|v| v == 1.0)
         .unwrap_or(true);
+    let snmp_ok = c
+        .snmp_avail
+        .as_ref()
+        .and_then(|i| i.last_f64())
+        .map(|v| v == 1.0)
+        .unwrap_or(true);
+    let icmp_ok = icmp_loss
+        .as_ref()
+        .and_then(|s| s.avg.or(s.cur))
+        .map(|loss| loss < 100.0)
+        .unwrap_or(true);
+    let available = match device_kind {
+        DeviceKind::Agent | DeviceKind::Unknown => agent_ok,
+        DeviceKind::Snmp => snmp_ok && icmp_ok,
+        DeviceKind::Mixed => agent_ok && snmp_ok,
+    };
 
     // ---- 服务探测 ----
     let services: Vec<ServiceCheck> = c
@@ -725,17 +753,26 @@ async fn inspect_host(
 
     // ---- 原始逐条数据（--raw）：核心指标的历史采样值 ----
     let raw_samples = if raw {
-        // Select core items: CPU util, memory util, disk pused (fullest), and optionally all numeric
+        // 👈 修改：核心指标过滤增加 SNMP key 兼容
         let raw_items: Vec<&ItemRec> = items
             .iter()
             .filter(|i| i.numeric())
             .filter(|i| {
+                // Agent CPU
                 i.key == "system.cpu.util"
-                    || i.key.starts_with("vm.memory.util")
-                    || i.key.starts_with("vm.memory.size[pavailable]")
-                    || i.key.starts_with("vfs.fs.pused")
-                    || i.key.starts_with("vfs.fs.dependent.size[") && i.key.ends_with(",pused]")
-                    || i.key.starts_with("vfs.fs.size[") && i.key.ends_with(",pused]")
+                // SNMP CPU：system.cpu.util[snmp] / system.cpu.util[snmp,0]
+                || i.key.starts_with("system.cpu.util[snmp")
+                // 内存利用率（Agent & SNMP 通用前缀）
+                || i.key.starts_with("vm.memory.util")
+                || i.key.starts_with("vm.memory.size[pavailable]")
+                // Agent 磁盘
+                || i.key.starts_with("vfs.fs.pused")
+                || (i.key.starts_with("vfs.fs.dependent.size[") && i.key.ends_with(",pused]"))
+                || (i.key.starts_with("vfs.fs.size[") && i.key.ends_with(",pused]"))
+                // SNMP 磁盘：pused 计算项 + used/total 原始项
+                || i.key.starts_with("vfs.fs.pused[storageUsedPercentage")
+                || i.key.starts_with("vfs.fs.used[hrStorageUsed")
+                || i.key.starts_with("vfs.fs.total[hrStorageSize")
             })
             .collect();
         if raw_items.is_empty() {
@@ -806,6 +843,7 @@ async fn inspect_host(
         os_family,
         host_disabled: host.status == "1",
         available,
+        device_kind,        // 👈 新增：把分类结果带进评分层
         metrics: MainMetrics { cpu, mem, swap, disk_max, inode_max, uptime_days },
         disks,
         nets,
