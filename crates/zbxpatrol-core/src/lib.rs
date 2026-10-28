@@ -16,5 +16,6 @@ pub mod scoring;
 pub mod patrol_config;
 pub mod problems;
 pub mod pipeline;
+pub mod device_kind;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
