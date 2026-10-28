@@ -3,6 +3,39 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+// ---------- 设备类型 ----------
+
+/// 主机监控方式（由巡检主流程基于监控项类型分类后填入 HostInspection）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DeviceKind {
+    /// 仅 Zabbix Agent
+    Agent,
+    /// 仅 SNMP（网络设备或 SNMP Agent）
+    Snmp,
+    /// 同时挂 Agent + SNMP
+    Mixed,
+    /// 无法判断（旧数据或未分类，行为等同原版 Agent）
+    #[default]
+    Unknown,
+}
+
+impl DeviceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            DeviceKind::Agent => "Agent",
+            DeviceKind::Snmp => "SNMP",
+            DeviceKind::Mixed => "Agent+SNMP",
+            DeviceKind::Unknown => "未知",
+        }
+    }
+    pub fn is_snmp(self) -> bool {
+        matches!(self, DeviceKind::Snmp | DeviceKind::Mixed)
+    }
+    pub fn is_agent(self) -> bool {
+        matches!(self, DeviceKind::Agent | DeviceKind::Mixed)
+    }
+}
+
 // ---------- 基础记录 ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +75,13 @@ pub struct ItemRec {
     /// "0" = 启用，"1" = 已停用
     #[serde(default)]
     pub status: String,
+    /// 监控项类型：0=Agent(passive), 1=SNMPv1, 3=SIMPLE, 4=SNMPv2, 5=INTERNAL,
+    /// 6=SNMPv3, 7=Agent(active), 15=CALCULATED, 18=DEPENDENT
+    #[serde(default)]
+    pub r#type: u8,
+    /// SNMP OID（仅 SNMP 类型有值）
+    #[serde(default)]
+    pub snmp_oid: Option<String>,
 }
 
 impl ItemRec {
@@ -242,6 +282,9 @@ pub struct HostInspection {
     /// Zabbix 中该主机已停用（不参与评分，报表标记「停用」）
     #[serde(default)]
     pub host_disabled: bool,
+    /// 设备类型（主流程基于监控项类型分类后填充；缺省 Unknown = 保持原版行为）
+    #[serde(default)]
+    pub device_kind: DeviceKind,
     pub metrics: MainMetrics,
     pub disks: Vec<DiskStat>,
     pub nets: Vec<NetIfStat>,
