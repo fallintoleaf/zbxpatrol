@@ -323,6 +323,8 @@ fn parse_items(v: &serde_json::Value, hostid: &str) -> Vec<ItemRec> {
                     lastvalue: it["lastvalue"].as_str().map(|s| s.to_string()),
                     lastclock: it["lastclock"].as_str().and_then(|s| s.parse().ok()),
                     status: it["status"].as_str().unwrap_or_default().into(),
+                    r#type: 0,
+                    snmp_oid: None,
                 })
                 .collect()
         })
