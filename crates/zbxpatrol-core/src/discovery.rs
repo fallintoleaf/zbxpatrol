@@ -88,7 +88,10 @@ pub struct HostClassified {
     pub zombies: Option<ItemRec>,
     pub proc_num: Option<ItemRec>,
     pub localtime: Option<ItemRec>,
+    /// Zabbix Agent 采集可用性（zabbix[host,active_agent,available] / agent.available）
     pub agent_avail: Option<ItemRec>,
+    /// SNMP 采集可用性（zabbix[host,snmp,available]）
+    pub snmp_avail: Option<ItemRec>,
     pub maxfiles: Option<ItemRec>,
     pub openfiles: Option<ItemRec>,
     pub os_uname: Option<ItemRec>,
@@ -103,18 +106,24 @@ pub struct HostClassified {
     pub others_numeric: Vec<ItemRec>,
 }
 
-/// 从 system.uname / system.sw.os 推导系统类型：返回 (类别, 详情)
+/// 从 system.uname / system.sw.os / system.descr[sysDescr.0] 推导系统类型：(类别, 详情)
 pub fn os_family_of(items: &[ItemRec]) -> (String, String) {
-    let detail = ["system.uname", "system.sw.os", "system.sw.os[short]"]
-        .iter()
-        .find_map(|k| {
-            items
-                .iter()
-                .find(|i| &i.key == k)
-                .and_then(|i| i.lastvalue.clone())
-                .filter(|v| !v.is_empty())
-        })
-        .unwrap_or_default();
+    // 优先 Agent 的 uname，其次 SNMP 的 sysDescr
+    let detail = [
+        "system.uname",
+        "system.sw.os",
+        "system.sw.os[short]",
+        "system.descr[sysDescr.0]",
+    ]
+    .iter()
+    .find_map(|k| {
+        items
+            .iter()
+            .find(|i| &i.key == k)
+            .and_then(|i| i.lastvalue.clone())
+            .filter(|v| !v.is_empty())
+    })
+    .unwrap_or_default();
     let d = detail.to_lowercase();
     let family = if d.contains("windows") || d.contains("microsoft") {
         "Windows"
@@ -130,6 +139,14 @@ pub fn os_family_of(items: &[ItemRec]) -> (String, String) {
         "HP-UX"
     } else if d.contains("sunos") || d.contains("solaris") {
         "Solaris"
+    } else if d.contains("cisco") || d.contains("ios") || d.contains("nx-os") {
+        "Cisco"
+    } else if d.contains("huawei") || d.contains("vrp") {
+        "Huawei"
+    } else if d.contains("h3c") {
+        "H3C"
+    } else if d.contains("juniper") || d.contains("junos") {
+        "Juniper"
     } else if detail.is_empty() {
         "未知"
     } else {
@@ -160,8 +177,8 @@ fn net_by_if<'a>(list: &'a mut Vec<NetItems>, ifname: &str) -> &'a mut NetItems 
 pub fn classify_host(items: &[ItemRec], rules: &CompiledRules) -> HostClassified {
     let mut c = HostClassified::default();
     for it in items {
-        // OS 信息取自字符型 uname
-        if it.key == "system.uname" {
+        // OS 信息取自字符型字段（uname / sysDescr）
+        if it.key == "system.uname" || it.key == "system.descr[sysDescr.0]" {
             c.os_uname = Some(it.clone());
             continue;
         }
@@ -189,6 +206,7 @@ pub fn classify_host(items: &[ItemRec], rules: &CompiledRules) -> HostClassified
             "proc_num" => c.proc_num = Some(it.clone()),
             "localtime" => c.localtime = Some(it.clone()),
             "agent_avail" => c.agent_avail = Some(it.clone()),
+            "snmp_avail" => c.snmp_avail = Some(it.clone()),
             "maxfiles" => c.maxfiles = Some(it.clone()),
             "openfiles" => c.openfiles = Some(it.clone()),
             "icmp_loss" => c.icmp_loss = Some(it.clone()),
@@ -280,6 +298,8 @@ mod tests {
             lastvalue: None,
             lastclock: None,
             status: "0".into(),
+            r#type: 0,
+            snmp_oid: None,
         }
     }
 
@@ -316,5 +336,46 @@ mod tests {
         // 未匹配的数值项进入 others；字符型不进
         assert_eq!(c.others_numeric.len(), 1);
         assert_eq!(c.others_numeric[0].key, "bigdata.flink.state");
+    }
+
+    #[test]
+    fn classify_snmp_items() {
+        // 模拟 Linux by SNMP 典型 item
+        let items = vec![
+            item("system.cpu.util[snmp,0]", 0),
+            item("system.cpu.num[snmp]", 3),
+            item("system.cpu.load.avg1[laLoad.1]", 0),
+            item("vm.memory.util[snmp]", 0),
+            item("system.swap.pfree[snmp]", 0),
+            item("system.hw.uptime[hrSystemUptime.0]", 3),
+            item("vfs.fs.used[hrStorageUsed.1]", 3),
+            item("vfs.fs.total[hrStorageSize.1]", 3),
+            item("vfs.fs.inode.pfree[dskPercentNode.1]", 0),
+            item("net.if.in[ifHCInOctets.1]", 3),
+            item("net.if.out[ifHCOutOctets.1]", 3),
+            item("net.if.in.errors[ifInErrors.1]", 3),
+            item("net.if.speed[ifHighSpeed.1]", 3),
+            item("icmppingloss", 0),
+            item("icmppingsec", 0),
+            item("zabbix[host,snmp,available]", 3),
+            item("system.descr[sysDescr.0]", 1),
+        ];
+        let c = classify_host(&items, &CompiledRules::default());
+        assert!(c.cpu_util.is_some(), "SNMP CPU 未归类");
+        assert!(c.cpu_num.is_some(), "SNMP CPU 核数未归类");
+        assert!(c.load1.is_some(), "SNMP load1 未归类");
+        assert!(c.mem_util.is_some(), "SNMP 内存利用率未归类");
+        assert!(c.swap_pfree.is_some(), "SNMP swap 未归类");
+        assert!(c.uptime.is_some(), "SNMP uptime 未归类");
+        assert_eq!(c.disks.len(), 1, "SNMP 磁盘未归类");
+        assert_eq!(c.disks[0].mount, "snmp1");
+        assert!(c.disks[0].inode_pfree.is_some());
+        assert_eq!(c.nets.len(), 1, "SNMP 网卡未归类");
+        assert_eq!(c.nets[0].ifname, "if1");
+        assert!(c.nets[0].in_err.is_some());
+        assert!(c.icmp_loss.is_some());
+        assert!(c.icmp_sec.is_some(), "SNMP ICMP 延迟未归类");
+        assert!(c.snmp_avail.is_some(), "SNMP 可用性未归类");
+        assert!(c.os_uname.is_some(), "SNMP sysDescr 未归类");
     }
 }
