@@ -4,9 +4,12 @@
 //! 全部百分比类阈值随基准平移（宽松 +10 / 标准 0 / 严格 -10，相对标准档）；
 //! 事件类规则（重启/OOM/僵尸/时间偏移/证书/告警）不随基准缩放。
 //! 自定义 TOML 规则存在时整体替换内置评分，不受严格度影响。
+//!
+//! 设备类型感知：SNMP 设备不使用 `available`（Agent 语义）作为可用性判据，
+//! 改用 ICMP 丢包率；Agent 设备的评分路径与原版完全一致。
 
 use crate::patrol_config::ScoringRule;
-use crate::types::{risk_level, HostInspection, RiskResult};
+use crate::types::{risk_level, DeviceKind, HostInspection, RiskResult};
 
 /// 评分严格度三档
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,7 +32,6 @@ impl Strictness {
             _ => None,
         }
     }
-    /// 基准（= 高危线）
     pub fn base(self) -> f64 {
         match self {
             Strictness::Loose => 90.0,
@@ -44,30 +46,24 @@ impl Strictness {
             Strictness::Strict => "严格",
         }
     }
-    /// CPU 阶梯：严重/高危/中危/低危（高危=基准-5；封顶 98 保持可达）
     pub fn util_levels(self) -> [f64; 4] {
         let b = self.base();
-        [ (b + 5.0).min(98.0), b - 5.0, b - 15.0, b - 30.0 ]
+        [(b + 5.0).min(98.0), b - 5.0, b - 15.0, b - 30.0]
     }
-    /// 内存阶梯（内存常态偏高，整体比 CPU 高一档；封顶 98）
     pub fn mem_levels(self) -> [f64; 4] {
         let b = self.base();
-        [ (b + 10.0).min(98.0), b, b - 10.0, b - 20.0 ]
+        [(b + 10.0).min(98.0), b, b - 10.0, b - 20.0]
     }
-    /// 磁盘/inode 阶梯（磁盘整体偏高一档；封顶 98）
     pub fn disk_levels(self) -> [f64; 4] {
         let b = self.base();
-        [ (b + 10.0).min(98.0), b + 5.0, b, b - 5.0 ]
+        [(b + 10.0).min(98.0), b + 5.0, b, b - 5.0]
     }
-    /// CPU 峰值阈值
     pub fn cpu_peak(self) -> f64 {
         (self.base() + 15.0).min(99.0)
     }
-    /// swap 阈值
     pub fn swap_thr(self) -> f64 {
         self.base() - 30.0
     }
-    /// 带宽/fd 使用率阈值
     pub fn pct_thr(self) -> f64 {
         self.base()
     }
@@ -85,7 +81,6 @@ impl Scorer {
     }
 
     pub fn with_strictness(custom: Option<Vec<ScoringRule>>, mode: Strictness) -> Self {
-        // 自定义规则整体替换内置评分，严格度不生效
         Scorer { custom, mode }
     }
 
@@ -141,16 +136,40 @@ fn tier(acc: &mut Acc, value: f64, levels: [f64; 4], base: [i64; 4], label: &str
 
 fn score_builtin(h: &HostInspection, mode: Strictness) -> RiskResult {
     let mut acc = Acc { points: 0, msgs: Vec::new(), floored: false };
+    let kind = h.device_kind;
 
-    // 可用性：直接严重
-    if !h.available {
-        acc.floor("主机不可达（Agent 无响应）".into());
+    // ---------- 可用性判断（按设备类型分叉） ----------
+    // Agent / Mixed / Unknown：沿用原逻辑（基于 h.available，即 Agent 可用性）
+    // Snmp：忽略 h.available，改用 ICMP 丢包率判据
+    match kind {
+        DeviceKind::Snmp => {
+            let icmp_avg = h.stability.icmp_loss.as_ref().and_then(|s| s.avg);
+            match icmp_avg {
+                Some(loss) if loss >= 99.0 => {
+                    acc.floor(format!("主机 ICMP 完全不可达（丢包 {loss:.0}%）"));
+                }
+                Some(_) => { /* 部分丢包由下面的 ICMP 检查处理 */ }
+                None => {
+                    // 没有任何 ICMP 数据，且主流程标记为不可达 → 保守升级
+                    if !h.available {
+                        acc.floor("主机不可达（SNMP 采集异常）".into());
+                    }
+                }
+            }
+        }
+        _ => {
+            if !h.available {
+                acc.floor("主机不可达（Agent 无响应）".into());
+            }
+        }
     }
+
+    // 服务探测失败（对 SNMP 设备通常无意义，但保留原逻辑；若主流程不填 services 则无影响）
     if let Some(svc) = h.services.iter().find(|s| !s.ok) {
         acc.floor(format!("服务探测失败：{}（{}）", svc.name, svc.key));
     }
 
-    // CPU
+    // ---------- CPU / 内存 / 磁盘（与原版一致，仅数据源更宽） ----------
     if let Some(avg) = h.metrics.cpu.avg {
         tier(&mut acc, avg, mode.util_levels(), [60, 45, 30, 15], "CPU");
     }
@@ -169,7 +188,6 @@ fn score_builtin(h: &HostInspection, mode: Strictness) -> RiskResult {
         }
     }
 
-    // 内存
     if let Some(avg) = h.metrics.mem.avg {
         tier(&mut acc, avg, mode.mem_levels(), [60, 45, 30, 15], "内存");
     }
@@ -179,7 +197,6 @@ fn score_builtin(h: &HostInspection, mode: Strictness) -> RiskResult {
         }
     }
 
-    // 磁盘：空间 + inode 阶梯、满盘预测
     if let Some(d) = h.metrics.disk_max.as_ref() {
         let v = d.space.avg.or(d.space.cur).unwrap_or(0.0);
         tier(&mut acc, v, mode.disk_levels(), [60, 45, 30, 15],
@@ -196,10 +213,13 @@ fn score_builtin(h: &HostInspection, mode: Strictness) -> RiskResult {
             &format!("inode 最满分区 {}", i.mount));
     }
 
-    // 网络
+    // ---------- 网络 ----------
     if let Some(loss) = h.stability.icmp_loss.as_ref().and_then(|s| s.avg) {
         if loss > 0.0 {
-            acc.add(10, format!("ICMP 平均丢包率 {loss:.1}%"));
+            // 完全不可达已在可用性层 floor，这里只对部分丢包加罚
+            if loss < 99.0 {
+                acc.add(10, format!("ICMP 平均丢包率 {loss:.1}%"));
+            }
         }
     }
     let err_total: u64 = h.nets.iter().filter_map(|n| n.out_errors.or(n.in_errors)).sum();
@@ -223,7 +243,7 @@ fn score_builtin(h: &HostInspection, mode: Strictness) -> RiskResult {
         }
     }
 
-    // 稳定性
+    // ---------- 稳定性（None 的指标自动跳过，天然兼容 SNMP 缺项） ----------
     let n = h.stability.reboots.unwrap_or(0);
     if n > 0 {
         acc.add(n * 15, format!("区间内发生 {n} 次重启"));
@@ -247,7 +267,7 @@ fn score_builtin(h: &HostInspection, mode: Strictness) -> RiskResult {
         }
     }
 
-    // 告警
+    // ---------- 告警 ----------
     let open_high = h.problems.iter().filter(|p| !p.recovered && p.severity >= 4).count();
     if open_high > 0 {
         let pts = (open_high as i64 * 5).min(20);
@@ -335,6 +355,7 @@ mod tests {
             os_family: "Linux".into(),
             available: true,
             host_disabled: false,
+            device_kind: DeviceKind::Unknown,
             metrics: MainMetrics {
                 cpu: MetricStats { avg: Some(20.0), max: Some(40.0), ..Default::default() },
                 mem: MetricStats { avg: Some(30.0), ..Default::default() },
@@ -388,7 +409,7 @@ mod tests {
             acknowledged: false, hosts: vec![],
         }];
         let r = Scorer::new(None).score(&h);
-        assert_eq!(r.score, 50); // 45(3次重启×15) + 5(告警)
+        assert_eq!(r.score, 50);
         assert_eq!(r.level, "低危");
     }
 
@@ -400,7 +421,7 @@ mod tests {
         }];
         let mut h = host();
         h.metrics.cpu.avg = Some(60.0);
-        h.metrics.mem.avg = Some(95.0); // 内置规则不应再生效
+        h.metrics.mem.avg = Some(95.0);
         let r = Scorer::new(Some(rules)).score(&h);
         assert_eq!(r.score, 30);
     }
@@ -419,7 +440,6 @@ mod tests {
 
     #[test]
     fn strictness_thresholds_match_spec() {
-        // 标准（基准 80）= v1.0 既有行为，逐项对照
         let s = Strictness::Standard;
         assert_eq!(s.base(), 80.0);
         assert_eq!(s.util_levels(), [85.0, 75.0, 65.0, 50.0]);
@@ -428,7 +448,6 @@ mod tests {
         assert_eq!(s.cpu_peak(), 95.0);
         assert_eq!(s.swap_thr(), 50.0);
         assert_eq!(s.pct_thr(), 80.0);
-        // 宽松（基准 90）：整体放宽 10 个点，封顶 98/99
         let l = Strictness::Loose;
         assert_eq!(l.base(), 90.0);
         assert_eq!(l.util_levels(), [95.0, 85.0, 75.0, 60.0]);
@@ -437,7 +456,6 @@ mod tests {
         assert_eq!(l.cpu_peak(), 99.0);
         assert_eq!(l.swap_thr(), 60.0);
         assert_eq!(l.pct_thr(), 90.0);
-        // 严格（基准 70）：整体收紧 10 个点
         let t = Strictness::Strict;
         assert_eq!(t.base(), 70.0);
         assert_eq!(t.util_levels(), [75.0, 65.0, 55.0, 40.0]);
@@ -450,7 +468,6 @@ mod tests {
 
     #[test]
     fn strictness_changes_score() {
-        // 内存 72%：标准=中危(30) 宽松=低危(15) 严格=高危(45)
         let mut h = host();
         h.metrics.mem.avg = Some(72.0);
         let std = Scorer::with_strictness(None, Strictness::Standard).score(&h);
@@ -470,5 +487,67 @@ mod tests {
         assert_eq!(Strictness::parse("std"), Some(Strictness::Standard));
         assert_eq!(Strictness::parse("严格"), Some(Strictness::Strict));
         assert_eq!(Strictness::parse("unknown"), None);
+    }
+
+    // ---------- 新增：SNMP 分支测试 ----------
+
+    #[test]
+    fn snmp_ignores_agent_available() {
+        let mut h = host();
+        h.device_kind = DeviceKind::Snmp;
+        // Agent 不可用（SNMP 设备本来就没 Agent，不应拉低评分）
+        h.available = false;
+        // 有 ICMP 数据但完全正常
+        h.stability.icmp_loss = Some(MetricStats { avg: Some(0.0), ..Default::default() });
+        h.metrics.cpu = MetricStats::default();
+        h.metrics.mem = MetricStats::default();
+        let r = Scorer::new(None).score(&h);
+        assert_eq!(r.score, 0, "SNMP 设备不应因 Agent 不可用被罚：{}", r.points.join(", "));
+        assert_eq!(r.level, "健康");
+    }
+
+    #[test]
+    fn snmp_icmp_full_loss_floors() {
+        let mut h = host();
+        h.device_kind = DeviceKind::Snmp;
+        h.stability.icmp_loss = Some(MetricStats { avg: Some(100.0), ..Default::default() });
+        h.metrics.cpu = MetricStats::default();
+        h.metrics.mem = MetricStats::default();
+        let r = Scorer::new(None).score(&h);
+        assert_eq!(r.score, 95);
+        assert!(r.points.iter().any(|p| p.contains("ICMP 完全不可达")));
+    }
+
+    #[test]
+    fn snmp_partial_icmp_loss() {
+        let mut h = host();
+        h.device_kind = DeviceKind::Snmp;
+        h.stability.icmp_loss = Some(MetricStats { avg: Some(20.0), ..Default::default() });
+        h.metrics.cpu = MetricStats::default();
+        h.metrics.mem = MetricStats::default();
+        let r = Scorer::new(None).score(&h);
+        assert_eq!(r.score, 10);
+        assert!(r.points.iter().any(|p| p.contains("ICMP 平均丢包率")));
+    }
+
+    #[test]
+    fn agent_path_unchanged() {
+        // 验证 Agent 分支与原版行为一致
+        let mut h = host();
+        h.device_kind = DeviceKind::Agent;
+        h.available = false;
+        let r = Scorer::new(None).score(&h);
+        assert_eq!(r.score, 95);
+        assert!(r.points.iter().any(|p| p.contains("Agent 无响应")));
+    }
+
+    #[test]
+    fn unknown_acts_as_agent_for_compat() {
+        // Unknown 走 Agent 分支，保证向后兼容
+        let mut h = host();
+        h.device_kind = DeviceKind::Unknown;
+        h.available = false;
+        let r = Scorer::new(None).score(&h);
+        assert_eq!(r.score, 95);
     }
 }
