@@ -1,4 +1,6 @@
 //! Zabbix JSON-RPC 客户端：登录/登出、Bearer 认证（7.x）、限速、重试、itemids 分批。
+//! 兼容说明：Zabbix < 6.4 使用 JSON body 中的 `auth` 字段传递会话 token；
+//!          Zabbix >= 6.4 使用 `Authorization: Bearer` 头。本模块会自动探测版本并选择。
 
 use crate::env::AppConfig;
 use crate::errors::{PatrolError, Result};
@@ -17,6 +19,8 @@ pub struct ZabbixClient {
     user: String,
     password: String,
     token: RwLock<Option<String>>,
+    /// 缓存的 Zabbix 版本号（用于选择 token 传递方式）
+    api_version: RwLock<Option<String>>,
     id: AtomicU64,
     /// 请求间隔限速（令牌间隔）
     throttle: Mutex<std::time::Instant>,
@@ -65,6 +69,7 @@ impl ZabbixClient {
             user: cfg.user.clone(),
             password: cfg.password.clone(),
             token: RwLock::new(None),
+            api_version: RwLock::new(None),
             id: AtomicU64::new(1),
             throttle: Mutex::new(std::time::Instant::now() - Duration::from_secs(1)),
             min_interval,
@@ -85,21 +90,81 @@ impl ZabbixClient {
         *last = std::time::Instant::now();
     }
 
+    /// 版本号是否属于使用 legacy `auth` 字段的时代（< 6.4）
+    fn version_is_legacy(ver: &str) -> bool {
+        // 版本形如 "6.0.20" / "7.0.3" / "6.4.1"
+        let mut it = ver.split('.');
+        let major: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        major < 6 || (major == 6 && minor < 4)
+    }
+
+    /// 判断当前连接是否需要使用 legacy `auth` 字段。
+    /// 未探测过版本时会发一次 `apiinfo.version`（无需认证，不会递归）。
+    async fn is_legacy_auth(&self) -> bool {
+        // 快速路径
+        if let Some(v) = self.api_version.read().await.as_ref() {
+            return Self::version_is_legacy(v);
+        }
+        // 直接 HTTP 探测（不经 raw_call，避免任何潜在递归）
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "apiinfo.version",
+            "params": {},
+            "id": 0,
+        });
+        if let Ok(resp) = self.http.post(&self.endpoint).json(&body).send().await {
+            if let Ok(text) = resp.text().await {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    if let Some(ver) = v.get("result").and_then(|r| r.as_str()) {
+                        let ver = ver.to_string();
+                        let legacy = Self::version_is_legacy(&ver);
+                        *self.api_version.write().await = Some(ver);
+                        tracing::debug!(
+                            "探测到 Zabbix 版本（auth 方式：{}）",
+                            if legacy { "legacy auth 字段" } else { "Bearer 头" }
+                        );
+                        return legacy;
+                    }
+                }
+            }
+        }
+        // 探测失败时保守回退：优先 Bearer（对 7.x 已知可用）
+        false
+    }
+
     /// 单次逻辑调用：传输层重试（网络/5xx/429），不做认证重试（无递归）
     async fn raw_call(&self, method: &str, params: Value, token: Option<&str>) -> Result<Value> {
         let mut attempt = 0u32;
         loop {
             self.throttle().await;
-            let body = json!({
+
+            // 仅在需要认证且有 token 时判断版本（apiinfo.version 本身无需认证）
+            let legacy_auth = if token.is_some() && method != "apiinfo.version" {
+                self.is_legacy_auth().await
+            } else {
+                false
+            };
+
+            let mut body = json!({
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params,
                 "id": self.id.fetch_add(1, Ordering::Relaxed),
             });
-            let mut req = self.http.post(&self.endpoint).json(&body);
+
+            let mut req = self.http.post(&self.endpoint);
             if let Some(t) = token {
-                req = req.bearer_auth(t);
+                if legacy_auth {
+                    // Zabbix < 6.4：token 必须放在 JSON body 的 auth 字段
+                    body["auth"] = json!(t);
+                } else {
+                    // Zabbix >= 6.4：使用 Authorization: Bearer
+                    req = req.bearer_auth(t);
+                }
             }
+            let req = req.json(&body);
+
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
@@ -177,12 +242,15 @@ impl ZabbixClient {
 
     // ---------- 会话 ----------
 
-    /// 无需认证的版本探测
+    /// 无需认证的版本探测（顺带缓存到 api_version）
     pub async fn api_version(&self) -> Result<String> {
         let v = self.raw_call("apiinfo.version", json!({}), None).await?;
-        v.as_str()
+        let ver = v
+            .as_str()
             .map(|s| s.to_string())
-            .ok_or_else(|| PatrolError::Api("apiinfo.version 返回格式异常".into()))
+            .ok_or_else(|| PatrolError::Api("apiinfo.version 返回格式异常".into()))?;
+        *self.api_version.write().await = Some(ver.clone());
+        Ok(ver)
     }
 
     pub async fn login(&self) -> Result<String> {
